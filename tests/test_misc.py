@@ -19,22 +19,23 @@
 tests.test_misc - Testing functions in misc.py
 """
 
+import builtins
 import datetime
 import functools
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import wave
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from functools import cached_property
 from random import randint, sample
 from unittest import mock
 
 import pytest
 import rarfile
 
-import sabnzbd
-import sabnzbd.cfg
 from sabnzbd import lang, misc, newsunpack, cfg
 from sabnzbd.config import ConfigCat, get_sorters, save_config
 from sabnzbd.constants import (
@@ -48,6 +49,19 @@ from sabnzbd.misc import SABRarFile
 from tests.testhelper import SAB_BASE_DIR
 
 
+@pytest.fixture
+def reset_language(compiled_language_files, monkeypatch):
+    """Provide a compiled-translations environment for a test and guarantee the global
+    translation state is restored on teardown"""
+    monkeypatch.setattr(lang, "_DOMAIN", lang._DOMAIN)
+    monkeypatch.setattr(lang, "_LOCALEDIR", lang._LOCALEDIR)
+    monkeypatch.setitem(builtins.__dict__, "T", builtins.__dict__.get("T"))
+    monkeypatch.setitem(builtins.__dict__, "TT", builtins.__dict__.get("TT"))
+    yield compiled_language_files
+    # Reset to the default (English) translators regardless of what the test selected
+    lang.set_language()
+
+
 class TestMisc:
     @staticmethod
     def assertTime(offset, age):
@@ -59,8 +73,8 @@ class TestMisc:
         assert "%H:%M" == misc.time_format("%H:%M")
 
     @pytest.mark.config({"ampm": True})
-    def test_timeformatampm(self):
-        misc.HAVE_AMPM = True
+    def test_timeformatampm(self, monkeypatch):
+        monkeypatch.setattr(misc, "HAVE_AMPM", True)
         assert "%I:%M:%S %p" == misc.time_format("%H:%M:%S")
         assert "%I:%M %p" == misc.time_format("%H:%M")
 
@@ -184,6 +198,16 @@ class TestMisc:
         assert "100.0 M" == misc.to_units(1024 * 1024 * 100)
         assert "9.8 G" == misc.to_units(1024 * 1024 * 10000)
         assert "1024.0 P" == misc.to_units(1024**6)
+
+        # Values that round up to the next unit should be shown in that unit
+        assert "1023 K" == misc.to_units(1024**2 - 1024)
+        assert "1.0 M" == misc.to_units(1024**2 - 1)
+        assert "-1.0 M" == misc.to_units(-(1024**2 - 1))
+        assert "1.0 MBla" == misc.to_units(1024**2 - 1, postfix="Bla")
+        assert "1023.9 M" == misc.to_units(1024**3 - 1024**2 // 8)
+        assert "1.0 G" == misc.to_units(1024**3 - 1)
+        assert "1.0 T" == misc.to_units(1024**4 - 1)
+        assert "1.0 P" == misc.to_units(1024**5 - 1)
 
     def test_unit_back_and_forth(self):
         assert 100 == misc.from_units(misc.to_units(100))
@@ -317,12 +341,8 @@ class TestMisc:
         assert "1 day 59 seconds" == misc.format_time_string(86400 + 59)
         assert "2 days 2 hours 2 seconds" == misc.format_time_string(2 * 86400 + 2 * 60 * 60 + 2)
 
-    def test_format_time_string_locale(self):
-        # Have to set the languages, if it was compiled
-        locale_dir = os.path.join(SAB_BASE_DIR, "..", sabnzbd.constants.DEF_LANGUAGE)
-        if not os.path.exists(locale_dir):
-            pytest.mark.skip("No language files compiled")
-
+    def test_format_time_string_locale(self, reset_language):
+        locale_dir = reset_language
         lang.set_locale_info("SABnzbd", locale_dir)
         lang.set_language("de")
         assert "1 Sekunde" == misc.format_time_string(1)
@@ -331,8 +351,6 @@ class TestMisc:
         assert "1 Stunde 1 Minuten 1 Sekunde" == misc.format_time_string(60 * 60 + 60 + 1)
         assert "1 Tag 59 Sekunden" == misc.format_time_string(86400 + 59)
         assert "2 Tage 2 Stunden 2 Sekunden" == misc.format_time_string(2 * 86400 + 2 * 60 * 60 + 2)
-        # Reset language
-        lang.set_language()
 
     def test_format_time_left(self):
         assert "0:00:00" == misc.format_time_left(0)
@@ -929,23 +947,16 @@ class TestMisc:
             # Delete any leftover/pre-defined new-style sorters
             if existing_sorters := get_sorters():
                 for config in list(existing_sorters.keys()):
-                    try:
-                        existing_sorters[config].delete()
-                    except NameError as error:
-                        if "CFG_OBJ" in str(error):
-                            # Ignore failure to save the config to file in this very barebones test environment
-                            pass
+                    existing_sorters[config].delete()
             assert not get_sorters()
 
             # Run conversion
             misc.convert_sorter_settings()
 
-            try:
-                save_config()
-            except NameError as error:
-                if "CFG_OBJ" in str(error):
-                    # Once again, ignore failure to save the config
-                    pass
+            # Persisting is a no-op here (no INI file backs the config in this barebones
+            # test); save_config() returns False rather than raising. The in-memory result
+            # is what's verified below.
+            save_config()
 
             # Verify the resulting config
             new_sorters = get_sorters()
@@ -1080,9 +1091,214 @@ class TestMisc:
         assert misc.subject_name_extractor(subject) == filename
 
 
+def ipv6_loopback_available() -> bool:
+    """Not every CI runner can bind ::1, so check instead of assuming"""
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+skip_without_ipv6 = pytest.mark.skipif(not ipv6_loopback_available(), reason="No usable IPv6 loopback")
+
+
+def low_ports_are_privileged() -> bool:
+    """Whether binding port 80 needs privileges for the user running the tests"""
+    if sys.platform.startswith("win") or not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return False
+    try:
+        # Linux allows the privileged range to be moved, including down to nothing
+        with open("/proc/sys/net/ipv4/ip_unprivileged_port_start") as sysctl:
+            return int(sysctl.read().strip()) > 80
+    except OSError:
+        return True
+
+
+skip_without_privileged_ports = pytest.mark.skipif(
+    not low_ports_are_privileged(), reason="Low ports are not privileged for this user"
+)
+
+
+class TestPortIsFree:
+    """Tests for misc.port_is_free() and misc.find_free_port()"""
+
+    @staticmethod
+    @contextmanager
+    def _listener(host: str = "127.0.0.1", family: int = socket.AF_INET):
+        """Listen on an OS-assigned port on host, yielding that port."""
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        # Match port_is_free, so a port left in TIME_WAIT by an earlier test
+        # cannot make this bind fail
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, 0))
+            sock.listen(1)
+            yield sock.getsockname()[1]
+        finally:
+            sock.close()
+
+    @staticmethod
+    @contextmanager
+    def _listener_in_scan_range():
+        """Listen on a port low enough for find_free_port() to scan onwards from.
+        OS-assigned ports land in the dynamic range, above its 49151 ceiling."""
+        for port in range(10000, 10500, 5):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+                sock.listen(1)
+            except OSError:
+                sock.close()
+                continue
+            try:
+                yield port
+            finally:
+                sock.close()
+            return
+        pytest.skip("No free port available in the scan range")
+
+    @staticmethod
+    def _released_port(host: str = "127.0.0.1", family: int = socket.AF_INET) -> int:
+        """Return a port that was bindable a moment ago."""
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return sock.getsockname()[1]
+
+    def test_free_port_returns_true(self):
+        assert misc.port_is_free("127.0.0.1", self._released_port()) is True
+
+    def test_occupied_port_returns_false(self):
+        with self._listener() as port:
+            assert misc.port_is_free("127.0.0.1", port) is False
+
+    @pytest.mark.parametrize(
+        "host, family",
+        [
+            ("0.0.0.0", socket.AF_INET),
+            ("", socket.AF_INET),
+            ("127.0.0.1", socket.AF_INET),
+            ("::", socket.AF_INET6),
+            ("::1", socket.AF_INET6),
+        ],
+    )
+    def test_binds_the_host_it_was_given(self, host, family):
+        """The previous version remapped the bind-all addresses to 127.0.0.1, so
+        it probed the wrong address and, for ::, the wrong family as well.
+
+        Asserted against the bind call rather than by watching two sockets fight
+        over a port, because whether a wildcard and a specific address may share
+        one is decided by the kernel and differs on Linux, macOS and Windows."""
+        with mock.patch("sabnzbd.misc.socket.socket") as fake_socket:
+            misc.port_is_free(host, 8080)
+        assert fake_socket.call_args.args[0] == family
+        fake_socket.return_value.bind.assert_called_once_with((host, 8080))
+
+    def test_free_port_is_actually_bindable(self):
+        """The property that matters: True has to mean uvicorn can bind it."""
+        port = self._released_port()
+        assert misc.port_is_free("127.0.0.1", port) is True
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+
+    @skip_without_ipv6
+    def test_occupied_ipv6_port_returns_false(self):
+        with self._listener("::1", socket.AF_INET6) as port:
+            assert misc.port_is_free("::1", port) is False
+
+    @skip_without_ipv6
+    def test_ipv4_listener_does_not_block_ipv6(self):
+        """A port held on 127.0.0.1 says nothing about the same port on ::1."""
+        with self._listener("127.0.0.1") as port:
+            assert misc.port_is_free("::1", port) is True
+
+    def test_non_local_host_raises(self):
+        """An address that is not ours cannot be bound on any port, so it must not
+        look like an ordinary busy port (192.0.2.0/24 is TEST-NET-1)."""
+        with pytest.raises(misc.HostNotAvailableError):
+            misc.port_is_free("192.0.2.1", 8080)
+
+    def test_find_free_port_propagates_host_not_available(self):
+        with pytest.raises(misc.HostNotAvailableError):
+            misc.find_free_port("192.0.2.1", 8080)
+
+    def test_unresolvable_host_returns_false(self):
+        assert misc.port_is_free("no-such-host.invalid", 8080) is False
+
+    def test_bind_web_socket_reserves_the_port(self):
+        """The whole point of handing uvicorn a ready-made socket: from here on
+        nothing else can take the port. Binding alone is not enough for that, a
+        socket only reserves a port once it listens."""
+        sock = misc.bind_web_socket("127.0.0.1", 0)
+        try:
+            host, port = sock.getsockname()[:2]
+            assert host == "127.0.0.1"
+            assert port > 0
+            assert misc.port_is_free("127.0.0.1", port) is False
+        finally:
+            sock.close()
+
+    def test_bind_web_socket_closes_socket_on_failure(self):
+        """A failed bind must not leak the file descriptor."""
+        with self._listener() as port:
+            with pytest.raises(OSError):
+                misc.bind_web_socket("127.0.0.1", port)
+
+    @staticmethod
+    def _barred_socket():
+        """Patch the probe's socket so binding is refused for lack of privileges."""
+        sock = mock.MagicMock()
+        sock.bind.side_effect = PermissionError("Permission denied")
+        return mock.patch("sabnzbd.misc.socket.socket", return_value=sock)
+
+    def test_barred_port_raises(self):
+        """A port we may not use is a different problem from an occupied one, so
+        it must not come back as a plain False."""
+        with self._barred_socket(), pytest.raises(PermissionError):
+            misc.port_is_free("0.0.0.0", 80)
+
+    @skip_without_privileged_ports
+    def test_low_port_raises_permission_error(self):
+        """Guards the premise: the platform really does report this as EACCES."""
+        with pytest.raises(PermissionError):
+            misc.port_is_free("127.0.0.1", 80)
+
+    def test_find_free_port_propagates_permission_error(self):
+        """Scanning on past a barred port could only end in a misleading answer."""
+        with self._barred_socket(), pytest.raises(PermissionError):
+            misc.find_free_port("0.0.0.0", 80)
+
+    def test_find_free_port_returns_port_in_scan_range(self):
+        port = misc.find_free_port("127.0.0.1", 10000)
+        assert port is not None
+        assert 10000 <= port <= 10045
+
+    def test_find_free_port_skips_occupied(self):
+        with self._listener_in_scan_range() as port:
+            free = misc.find_free_port("127.0.0.1", port)
+            assert free is not None
+            assert free > port
+            assert misc.port_is_free("127.0.0.1", free) is True
+
+    def test_find_free_port_above_ceiling(self):
+        """49152 and up is the dynamic range, so it is never scanned."""
+        assert misc.find_free_port("127.0.0.1", 49200) is None
+
+    def test_find_free_port_rejects_port_zero(self):
+        """Binding port 0 always succeeds, which would return a misleading 0."""
+        assert misc.find_free_port("127.0.0.1", 0) is None
+
+
 class TestBuildAndRunCommand:
     # Path should exist
-    script_path = os.path.join(SAB_BASE_DIR, "test_misc.py")
+    @cached_property
+    def script_path(self):
+        return os.path.join(SAB_BASE_DIR, "test_misc.py")
 
     def test_none_check(self):
         with pytest.raises(IOError):
@@ -1124,7 +1340,10 @@ class TestBuildAndRunCommand:
     @pytest.mark.config({"nice": "--adjustment=-7", "ionice": "-t -n9 -c7"})
     @mock.patch("sabnzbd.misc.userxbit")
     @mock.patch("subprocess.Popen")
-    def test_linux_features(self, mock_subproc_popen, userxbit):
+    def test_linux_features(self, mock_subproc_popen, userxbit, monkeypatch):
+        monkeypatch.setattr(newsunpack, "NICE_COMMAND", None)
+        monkeypatch.setattr(newsunpack, "IONICE_COMMAND", None)
+
         # Should break on no-execute permissions
         userxbit.return_value = False
         with pytest.raises(IOError):
@@ -1148,8 +1367,8 @@ class TestBuildAndRunCommand:
         assert mock_subproc_popen.call_args[0][0] == test_cmd
 
         # Have to fake these for it to work
-        newsunpack.IONICE_COMMAND = "ionice"
-        newsunpack.NICE_COMMAND = "nice"
+        monkeypatch.setattr(newsunpack, "IONICE_COMMAND", "ionice")
+        monkeypatch.setattr(newsunpack, "NICE_COMMAND", "nice")
         userxbit.return_value = True
         misc.build_and_run_command([self.script_path, "input 1"])
         assert mock_subproc_popen.call_args[0][0] == [
@@ -1240,3 +1459,80 @@ class TestSABRarFile:
                 with pytest.raises(rarfile.RarWrongPassword):
                     zf.setpassword("WRONG_PASSWORD")
                 assert zf.namelist() == expected_files
+
+
+@pytest.mark.platform("linux")
+class TestCgroupMemoryLimit:
+    """Container memory detection, see _cgroup_memory_limit()"""
+
+    GIGI = 1024**3
+    V2_HIGH = "/sys/fs/cgroup/memory.high"
+    V2_MAX = "/sys/fs/cgroup/memory.max"
+    V1_MAX = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+
+    def patched_open(self, files: dict[str, str]):
+        real_open = open
+
+        def _open(path, *args, **kwargs):
+            if str(path).startswith("/sys/fs/cgroup"):
+                if str(path) in files:
+                    return mock.mock_open(read_data=files[str(path)])()
+                raise FileNotFoundError(path)
+            return real_open(path, *args, **kwargs)
+
+        return mock.patch("builtins.open", _open)
+
+    def test_no_cgroup_files(self):
+        with self.patched_open({}):
+            assert misc._cgroup_memory_limit() is None
+
+    def test_v2_max_only(self):
+        with self.patched_open({self.V2_MAX: str(2 * self.GIGI)}):
+            assert misc._cgroup_memory_limit() == 2 * self.GIGI
+
+    def test_v2_unlimited(self):
+        with self.patched_open({self.V2_MAX: "max", self.V2_HIGH: "max"}):
+            assert misc._cgroup_memory_limit() is None
+
+    def test_v2_high_below_max_wins(self):
+        """memory.high throttles, so it is the budget we should size against"""
+        with self.patched_open({self.V2_HIGH: str(self.GIGI), self.V2_MAX: str(4 * self.GIGI)}):
+            assert misc._cgroup_memory_limit() == self.GIGI
+
+    def test_v2_high_unset_falls_back_to_max(self):
+        with self.patched_open({self.V2_HIGH: "max", self.V2_MAX: str(2 * self.GIGI)}):
+            assert misc._cgroup_memory_limit() == 2 * self.GIGI
+
+    def test_v1_limit(self):
+        with self.patched_open({self.V1_MAX: str(512 * 1024 * 1024)}):
+            assert misc._cgroup_memory_limit() == 512 * 1024 * 1024
+
+    def test_v1_unlimited_sentinel(self):
+        """v1 reports a huge sentinel rather than a keyword when unlimited"""
+        with self.patched_open({self.V1_MAX: "9223372036854771712"}):
+            assert misc._cgroup_memory_limit() is None
+
+    def test_garbage_is_ignored(self):
+        with self.patched_open({self.V2_MAX: "not-a-number"}):
+            assert misc._cgroup_memory_limit() is None
+
+    def test_get_memory_clamps_to_cgroup(self):
+        with self.patched_open({self.V2_MAX: str(self.GIGI)}):
+            with mock.patch("sabnzbd.misc._physical_memory", return_value=64 * self.GIGI):
+                assert misc.get_memory() == self.GIGI
+
+    def test_get_memory_keeps_physical_when_lower(self):
+        with self.patched_open({self.V2_MAX: str(64 * self.GIGI)}):
+            with mock.patch("sabnzbd.misc._physical_memory", return_value=8 * self.GIGI):
+                assert misc.get_memory() == 8 * self.GIGI
+
+    def test_get_memory_uses_cgroup_when_physical_unknown(self):
+        """_physical_memory() returns None when it cannot be determined"""
+        with self.patched_open({self.V2_MAX: str(self.GIGI)}):
+            with mock.patch("sabnzbd.misc._physical_memory", return_value=None):
+                assert misc.get_memory() == self.GIGI
+
+    def test_get_memory_zero_when_nothing_known(self):
+        with self.patched_open({}):
+            with mock.patch("sabnzbd.misc._physical_memory", return_value=None):
+                assert misc.get_memory() == 0

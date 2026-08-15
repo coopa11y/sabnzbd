@@ -1196,11 +1196,8 @@ tr.queue-item>td:first-child>a {
     font-weight: bold;
 }
 
-.mark-completed-link {
-    font-weight: bold !important;
-    color: #28a745 !important;
-    text-decoration: underline;
-    margin-left: 10px;
+.mark-completed-btn {
+    margin: 4px 0;
 }
 
 .history-status-hidden {
@@ -2297,7 +2294,7 @@ legend {
 .pagination li.active a:hover,
 .pagination li.active span:hover,
 .pagination>li>span:hover {
-    background-color: var(--clr-table-row-alt);
+    background-color: var(--clr-table-bg);
     border: 1px solid var(--clr-border-subtle);
     color: var(--clr-text);
 }
