@@ -41,7 +41,6 @@
         </div>
         <div class="col1">
             <form data-form="add-server" action="$url('config/server/add_server')" method="post" autocomplete="off">
-                <input type="hidden" name="apikey" value="$apikey" />
                 <input type="hidden" name="output" value="json" />
                 <fieldset>
                     <div class="field-pair">
@@ -154,7 +153,6 @@
     <!--#set $last_prio = -1 #-->
     <!--#for $cur, $server in enumerate($servers) #-->
         <form action="$url('config/server/save_server')" method="post" class="fullform" autocomplete="off">
-            <input type="hidden" name="apikey" value="$apikey" />
             <input type="hidden" name="output" value="json" />
             <input type="hidden" name="server" value="$server['name']" />
 
@@ -479,10 +477,9 @@
         // Initialize tooltips
         jQuery('[data-toggle="tooltip"]').tooltip()
         
-        // Reload form in case we change items that make the servers appear different
+        // Reload the page after saving in case we change items that make the servers appear different
         jQuery('input[name="priority"], input[name="displayname"], textarea[name="notes"]').on('change', function(event) {
-            var parentForm = jQuery(event.target).parents("form")
-            parentForm.unbind("submit")
+            jQuery(event.target).parents("form").attr("data-reload-on-save", "")
         })
 
         /**
@@ -549,7 +546,7 @@
             theButton.attr("disabled", "disabled")
             theButton.attr("aria-busy", "true")
             theButton.find('span').toggleClass('glyphicon-sort glyphicon-refresh spin-glyphicon')
-            resultBox.removeClass('alert-success alert-danger').html("$T('srv-testing')").show()
+            resultBox.removeClass('alert-success alert-danger').addClass('alert-info').html("$T('srv-testing')").show()
             jQuery.ajax({
                 type: "POST",
                 url: "$url('api')",
@@ -559,7 +556,7 @@
                 msg = data.value.message.replace('https://sabnzbd.org/certificate-errors', '<a href="https://sabnzbd.org/certificate-errors" class="alert-link" target="_blank">https://sabnzbd.org/certificate-errors</a>')
                 msg = msg.replace('-', '<br>')
                 // Fill the box and enable the button
-                resultBox.removeClass('alert-success alert-danger').show()
+                resultBox.removeClass('alert-info alert-success alert-danger').show()
                 resultBox.html(msg)
                 theButton.removeAttr("disabled")
                 theButton.attr("aria-busy", "false")
@@ -645,7 +642,7 @@
             jQuery.ajax({
                 type: "POST",
                 url: "$url('config/server/toggle_server')",
-                data: {server: whichServer, apikey: "$apikey" }
+                data: {server: whichServer }
             }).done(function() {
                 // Let us leave!
                 formWasSubmitted = true;

@@ -35,7 +35,10 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 
+import sabnzbd
+import sabnzbd.sessionstore as sessionstore
 from sabnzbd.constants import DB_HISTORY_NAME, DEF_ADMIN_DIR, DEF_INI_FILE
+from sabnzbd.filesystem import load_data, save_data
 from tests.testhelper import (
     FakeHistoryDB,
     SAB_BASE_DIR,
@@ -45,7 +48,6 @@ from tests.testhelper import (
     SAB_NEWSSERVER_HOST,
     SAB_NEWSSERVER_PORT,
     SAB_PORT,
-    SABnzbdBaseTest,
     get_api_result,
     get_url_result,
     wait_for,
@@ -138,7 +140,7 @@ def run_sabnzbd(clean_cache_dir, compiled_language_files, request):
     def shutdown_sabnzbd():
         # Shutdown SABnzbd
         try:
-            get_url_result("shutdown", SAB_HOST, SAB_PORT)
+            get_api_result("shutdown", SAB_HOST, SAB_PORT)
         except requests.ConnectionError:
             sabnzbd_process.kill()
         except Exception as err:
@@ -226,7 +228,6 @@ def run_sabnews_and_selenium(request):
 
     # Start the driver and pass it on to all the classes
     driver = webdriver.Chrome(options=driver_options)
-    SABnzbdBaseTest.driver = driver
 
     # Start SABNews on this worker's own host/port so parallel workers don't
     # collide on a single fixed newsserver port.
@@ -242,7 +243,7 @@ def run_sabnews_and_selenium(request):
     )
 
     # Now we run the tests
-    yield
+    yield driver
 
     # Shutdown SABNews
     try:
@@ -292,3 +293,15 @@ def update_history_specs(request):
 
     # Test o'clock
     return
+
+
+@pytest.fixture
+def session_store(tmp_path, monkeypatch):
+    """Wire sabnzbd.SessionStore to a store that saves into tmp_path"""
+    monkeypatch.setattr(sessionstore, "save_admin", lambda data, name: save_data(data, name, str(tmp_path)))
+    monkeypatch.setattr(
+        sessionstore, "load_admin", lambda name, **kwargs: load_data(name, str(tmp_path), remove=False, silent=True)
+    )
+    store = sessionstore.SessionStore()
+    monkeypatch.setattr(sabnzbd, "SessionStore", store, raising=False)
+    return store
